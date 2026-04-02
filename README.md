@@ -1,17 +1,19 @@
 # Multi-Agent Slack Bot System
 
-A lightweight system where multiple Slack bots converse with each other, each powered by Claude via the `claude` CLI (print mode) with its own persona defined in a SOUL.md file.
+A lightweight system where multiple Slack bots converse with each other, each powered by Claude with its own persona defined in a SOUL.md file. Supports two backends: direct Anthropic API (fast, ~2-5s) or Claude CLI with OAuth (~6s).
 
 Each bot:
 - Responds when @mentioned in a channel or via DM
-- Calls Claude via `claude -p` CLI subprocess (with hooks disabled for speed)
+- Calls Claude via direct API or CLI subprocess (auto-selected based on auth config)
 - Can @mention other bots, triggering chain reactions
 
 ## Prerequisites
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) package manager
-- [Claude Code CLI](https://claude.ai/code) (`claude`) installed and authenticated
+- One of:
+  - `ANTHROPIC_API_KEY` — direct API access (recommended, fastest)
+  - [Claude Code CLI](https://claude.ai/code) (`claude`) installed and authenticated — uses `CLAUDE_CODE_OAUTH_TOKEN`
 - Slack Bot/App tokens for each agent (Socket Mode enabled)
 
 ## Quick Start
@@ -40,8 +42,8 @@ Copy `.env.example` to `.env` and fill in the values.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Claude API key (used by CLI auth) |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | OAuth token (used by CLI auth) |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key (enables fast direct API backend) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | OAuth token (fallback: uses Claude CLI subprocess) |
 | `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Model to use |
 | `CLAUDE_CLI` | `claude` | Path to Claude Code CLI binary |
 | `MAX_TOKENS` | `4096` | Max response tokens |
@@ -121,8 +123,8 @@ Repeat for each agent bot.
 ## How It Works
 
 - All bots run concurrently in a single Python process via `asyncio`
-- When a bot is @mentioned, it builds a conversation from thread history, calls Claude via `claude -p` CLI subprocess, and posts the response directly to the channel
-- The CLI is invoked with hooks/plugins disabled (`--settings '{"hooks":{}}' --setting-sources '' --disable-slash-commands`) for ~6s response time instead of ~50s
+- When a bot is @mentioned, it builds a conversation from thread history, calls Claude, and posts the response directly to the channel
+- **Hybrid backend**: if `ANTHROPIC_API_KEY` is set, uses direct Anthropic API (~2-5s). Otherwise falls back to `claude -p` CLI subprocess with hooks disabled (~6s)
 - If the response @mentions another bot, that bot picks up and responds (chain reaction)
 - Loop prevention: each thread has a max response count (`MAX_CHAIN_DEPTH`)
 - Conversation history is kept in-memory (last 20 messages per thread), lost on restart
