@@ -147,6 +147,7 @@ _FAST_CLI_FLAGS = [
     "--settings", '{"hooks":{}}',
     "--setting-sources", "",
     "--disable-slash-commands",
+    "--allowedTools", "",
 ]
 
 
@@ -181,10 +182,13 @@ async def _call_claude_api(system_prompt: str, messages: list[dict]) -> str:
         return f"API call failed: {str(e)[:200]}"
 
 
+CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "120"))  # seconds
+
+
 async def _call_claude_sdk(system_prompt: str, messages: list[dict]) -> str:
     """Call Claude via claude-agent-sdk (uses CLAUDE_CODE_OAUTH_TOKEN).
 
-    Spawns `claude -p` subprocess with hooks disabled for speed.
+    Sends prompt via stdin to avoid arg length limits. Timeout prevents hangs.
     """
     prompt = _format_prompt(messages)
     cmd = [
@@ -194,25 +198,44 @@ async def _call_claude_sdk(system_prompt: str, messages: list[dict]) -> str:
         "--output-format", "json",
         "--max-turns", "1",
         *_FAST_CLI_FLAGS,
-        prompt,
     ]
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode()),
+            timeout=CLI_TIMEOUT,
+        )
 
+        raw = stdout.decode()
         if proc.returncode != 0:
-            err = stderr.decode().strip()[:200]
-            logger.error(f"Claude CLI error (exit {proc.returncode}): {err}")
-            return f"CLI error: {err}"
+            err = stderr.decode().strip()
+            logger.error(f"Claude CLI error (exit {proc.returncode}) stderr: {err}")
+            # Try to extract result even from error responses (e.g. max_turns)
+            try:
+                data = _json.loads(raw)
+                if data.get("result"):
+                    return data["result"]
+            except _json.JSONDecodeError:
+                pass
+            logger.error(f"Claude CLI error stdout: {raw[:500]}")
+            return f"CLI error (exit {proc.returncode}): {err or 'see logs'}"
 
-        data = _json.loads(stdout.decode())
+        try:
+            data = _json.loads(raw)
+        except _json.JSONDecodeError:
+            logger.error(f"Claude CLI returned invalid JSON: {raw[:500]}")
+            return "CLI returned invalid response."
         return data.get("result", "") or "No response from Claude."
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.error(f"Claude CLI timed out after {CLI_TIMEOUT}s")
+        return f"CLI timed out after {CLI_TIMEOUT}s"
     except Exception as e:
         logger.error(f"Claude CLI error: {e}")
         return f"CLI call failed: {str(e)[:200]}"
