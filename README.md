@@ -26,9 +26,9 @@ uv sync
 cp .env.example .env
 # Edit .env with your actual tokens
 
-# 3. Create SOUL.md files for your agents
-mkdir -p agents/friday
-# See "Configuring SOUL.md" below
+# 3. Create SOUL.md for your agents
+mkdir -p agents/my-agent
+# Write agents/my-agent/SOUL.md
 
 # 4. Run
 uv run multi-agent
@@ -49,55 +49,59 @@ Copy `.env.example` to `.env` and fill in the values.
 | `MAX_TOKENS` | `4096` | Max response tokens |
 | `AGENTS_DIR` | `./agents` | Base directory for SOUL.md files |
 | `MAX_CHAIN_DEPTH` | `10` | Max bot responses per thread (loop prevention) |
+| `COOLDOWN_SECONDS` | `2.0` | Delay between consecutive responses (seconds) |
 
-**Per-agent settings** (replace `{NAME}` with agent identifier, e.g. `FRIDAY`):
+**Per-agent settings** (replace `{NAME}` with agent identifier, e.g. `MY_AGENT`):
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `AGENT_{NAME}_BOT_TOKEN` | Yes | Slack Bot token (`xoxb-...`) |
-| `AGENT_{NAME}_APP_TOKEN` | Yes | Slack App token (`xapp-...`) |
-| `AGENT_{NAME}_SOUL` | No | Path to SOUL.md (defaults to `./agents/{name}/SOUL.md`) |
-| `AGENT_{NAME}_NAME` | No | Display name (defaults to titlecased `{NAME}`) |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AGENT_{NAME}_ENABLED` | No | `true` | Enable/disable agent (`false`, `0`, `no`, `off` to disable) |
+| `AGENT_{NAME}_BOT_TOKEN` | Yes | — | Slack Bot token (`xoxb-...`) |
+| `AGENT_{NAME}_APP_TOKEN` | Yes | — | Slack App token (`xapp-...`) |
+| `AGENT_{NAME}_SOUL` | No | `./agents/{name}/SOUL.md` | Path to SOUL.md |
+| `AGENT_{NAME}_NAME` | No | Titlecased `{NAME}` | Display name |
 
-## Configuring SOUL.md
+**Example `.env`:**
 
-Each agent needs a `SOUL.md` file that defines its persona, role, and behavior. Place it at the path specified by `AGENT_{NAME}_SOUL` (or the default `./agents/{name}/SOUL.md`).
+```bash
+# Enable/disable without removing config
+AGENT_MY_AGENT_ENABLED=true
+AGENT_MY_AGENT_NAME=My Agent
+AGENT_MY_AGENT_BOT_TOKEN=xoxb-...
+AGENT_MY_AGENT_APP_TOKEN=xapp-...
+AGENT_MY_AGENT_SOUL=./agents/my-agent/SOUL.md
+```
 
-**Example directory structure:**
+## Adding an Agent
+
+1. Create a directory under `agents/`:
 
 ```
 agents/
-├── friday/
-│   └── SOUL.md
-├── black-widow/
-│   └── SOUL.md
-└── hulk/
+└── my-agent/
     └── SOUL.md
 ```
 
-**Example `agents/friday/SOUL.md`:**
+2. Write a `SOUL.md` that defines the agent's persona. This becomes the system prompt for Claude calls. The system automatically appends a team roster and communication rules.
 
-```markdown
-# FRIDAY — Product Owner
+A typical SOUL.md contains:
+- **Core Identity** — role, philosophy, core principles
+- **Knowledge references** — paths to domain knowledge files (`~/.claude/knowledge/{role}/`)
+- **Task-knowledge mapping** — which knowledge files to consult per task type
+- **Communication protocol** — Slack interaction rules, escalation policy
+- **Loop prevention rules** — max round-trips, escalation triggers
 
-You are FRIDAY, the Product Owner of this team.
+3. Add environment variables to `.env`:
 
-## Responsibilities
-- Break down user requests into actionable tasks
-- Assign tasks to the appropriate team member
-- Track progress and ensure quality
-
-## Personality
-- Professional but approachable
-- Decisive and organized
-- Focuses on delivering value
-
-## Team
-- @Black Widow — UI/UX Designer
-- @Hulk — Backend Engineer
+```bash
+AGENT_MY_AGENT_ENABLED=true
+AGENT_MY_AGENT_NAME=My Agent
+AGENT_MY_AGENT_BOT_TOKEN=xoxb-...
+AGENT_MY_AGENT_APP_TOKEN=xapp-...
+AGENT_MY_AGENT_SOUL=./agents/my-agent/SOUL.md
 ```
 
-The SOUL.md content becomes the system prompt for that agent's Claude calls. The system automatically appends a team roster and communication rules.
+4. Run `uv run multi-agent`. The agent is auto-discovered from `AGENT_{NAME}_BOT_TOKEN` env vars.
 
 ## Slack App Setup
 
@@ -122,9 +126,14 @@ Repeat for each agent bot.
 
 ## How It Works
 
-- All bots run concurrently in a single Python process via `asyncio`
-- When a bot is @mentioned, it builds a conversation from thread history, calls Claude, and posts the response directly to the channel
-- **Hybrid backend**: if `ANTHROPIC_API_KEY` is set, uses direct Anthropic API (~2-5s). Otherwise falls back to `claude -p` CLI subprocess with hooks disabled (~6s)
-- If the response @mentions another bot, that bot picks up and responds (chain reaction)
-- Loop prevention: each thread has a max response count (`MAX_CHAIN_DEPTH`)
-- Conversation history is kept in-memory (last 20 messages per thread), lost on restart
+- **Single process, multi-bot**: all bots run concurrently via `asyncio.gather`. Each bot is an independent `AgentBot` instance with its own Slack `AsyncApp` and Socket Mode connection.
+- **Hybrid backend**: if `ANTHROPIC_API_KEY` is set, uses direct Anthropic API (~2-5s). Otherwise falls back to `claude -p` CLI subprocess with hooks disabled (~6s).
+- **Chain reactions**: if a bot's response @mentions another bot, that bot picks up and responds.
+- **Loop prevention**: per-thread response counter capped at `MAX_CHAIN_DEPTH`. Bots ignore their own messages.
+- **Enable/disable**: each agent can be toggled via `AGENT_{NAME}_ENABLED` without removing config.
+- **Agent discovery**: `load_agents()` scans environment variables for `AGENT_{NAME}_BOT_TOKEN` patterns. No registry file needed.
+- **Conversation history**: in-memory per thread (last 20 messages), lost on restart.
+
+## Special Thanks
+
+- [juchanhwang/my-harness](https://github.com/juchanhwang/my-harness) — agent persona definitions

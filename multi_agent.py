@@ -90,6 +90,12 @@ def load_agents() -> list[AgentConfig]:
             agent_names.add(match.group(1))
 
     for name_key in sorted(agent_names):
+        # Check enabled flag (default: true)
+        enabled = os.environ.get(f"AGENT_{name_key}_ENABLED", "true").lower()
+        if enabled in ("false", "0", "no", "off"):
+            logger.info(f"Agent {name_key}: disabled, skipping")
+            continue
+
         bot_token = os.environ.get(f"AGENT_{name_key}_BOT_TOKEN", "")
         app_token = os.environ.get(f"AGENT_{name_key}_APP_TOKEN", "")
         soul_file = os.environ.get(
