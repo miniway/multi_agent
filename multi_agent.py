@@ -122,6 +122,106 @@ def _append_daily_log(agent_dir: Path, role: str, content: str) -> None:
         f.write(entry)
 
 
+# ============================================================
+# Cron Scheduler
+# ============================================================
+from datetime import datetime, timedelta
+
+# <nopost/> tag — agent includes this to suppress Slack posting
+_NOPOST_TAG_RE = re.compile(r"<nopost\s*/?>", re.DOTALL)
+
+
+@dataclass
+class CronTask:
+    """A scheduled recurring task from CRON.md.
+
+    Schedule types:
+      - every 30m / every 2h / every 1d  (interval)
+      - daily 09:00                       (fixed time, every day)
+      - weekdays 09:00                    (Mon-Fri only)
+
+    Target:
+      - channel: CHANNEL_ID  (post to channel)
+      - dm: USER_ID          (post as DM)
+
+    Post mode:
+      - always      (default: always post)
+      - conditional (post unless agent returns <nopost/>)
+      - silent      (never post, log only)
+    """
+    name: str
+    schedule: str           # raw schedule string
+    prompt: str
+    channel: str = ""       # Slack channel ID
+    dm: str = ""            # Slack user ID for DM
+    post: str = "always"    # always | conditional | silent
+
+
+def _parse_interval(spec: str) -> int:
+    """Parse interval string like '30m', '2h', '1d' to seconds."""
+    spec = spec.strip().lower()
+    m = re.match(r"^(\d+)\s*(s|m|h|d)$", spec)
+    if not m:
+        raise ValueError(f"Invalid interval: {spec}")
+    val, unit = int(m.group(1)), m.group(2)
+    return val * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def _seconds_until(hour: int, minute: int, weekdays_only: bool = False) -> int:
+    """Seconds until the next occurrence of HH:MM (local time)."""
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    if weekdays_only:
+        while target.weekday() >= 5:  # 5=Sat, 6=Sun
+            target += timedelta(days=1)
+    return int((target - now).total_seconds())
+
+
+def _parse_cron_md(path: Path) -> list[CronTask]:
+    """Parse CRON.md into a list of CronTask.
+
+    Format:
+        ## Task Name
+        - schedule: every 30m | daily 09:00 | weekdays 09:00
+        - channel: C090L76SYLA   (or dm: U12345)
+        - prompt: What to do
+        - post: always | conditional | silent
+    """
+    content = _load_file(path)
+    if not content:
+        return []
+
+    tasks = []
+    current_name = None
+    current = {}
+
+    def _save_current():
+        if current_name and "schedule" in current and "prompt" in current:
+            tasks.append(CronTask(
+                name=current_name,
+                schedule=current["schedule"],
+                prompt=current["prompt"],
+                channel=current.get("channel", ""),
+                dm=current.get("dm", ""),
+                post=current.get("post", "always"),
+            ))
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if line.startswith("## "):
+            _save_current()
+            current_name = line[3:].strip()
+            current = {}
+        elif line.startswith("- ") and ":" in line:
+            key, _, val = line[2:].partition(":")
+            current[key.strip().lower()] = val.strip()
+
+    _save_current()
+    return tasks
+
+
 def _extract_and_strip_memory(text: str) -> tuple[str, list[str]]:
     """Extract <memory> tags from response. Returns (cleaned_text, memory_entries)."""
     entries = _MEMORY_TAG_RE.findall(text)
@@ -656,13 +756,110 @@ class AgentBot:
             logger.error(f"[{self.config.name}] Auth failed: {e}")
             return
 
+        # Start cron tasks
+        self._cron_tasks: list[asyncio.Task] = []
+        cron_file = self.config.agent_dir / "CRON.md"
+        cron_entries = _parse_cron_md(cron_file)
+        if cron_entries:
+            logger.info(f"[{self.config.name}] CRON: {len(cron_entries)} tasks loaded")
+            for entry in cron_entries:
+                task = asyncio.create_task(self._run_cron(entry, client))
+                self._cron_tasks.append(task)
+                target = entry.channel or entry.dm or "log-only"
+                logger.info(
+                    f"[{self.config.name}] CRON: '{entry.name}' ({entry.schedule})"
+                    f" → {target} [post={entry.post}]"
+                )
+
         self.handler = AsyncSocketModeHandler(self.app, self.config.app_token)
         await self.handler.start_async()
+
+    async def _run_cron(self, task: CronTask, client: AsyncWebClient):
+        """Run a single cron task on its schedule."""
+        name = self.config.name
+        schedule = task.schedule.strip().lower()
+
+        # Initial delay to let the bot fully start
+        await asyncio.sleep(10)
+        logger.info(f"[{name}] CRON '{task.name}': started ({task.schedule})")
+
+        while True:
+            # Calculate sleep duration based on schedule type
+            try:
+                if schedule.startswith("every "):
+                    sleep_secs = _parse_interval(schedule[6:])
+                elif schedule.startswith("daily "):
+                    h, m = map(int, schedule[6:].strip().split(":"))
+                    sleep_secs = _seconds_until(h, m)
+                elif schedule.startswith("weekdays "):
+                    h, m = map(int, schedule[9:].strip().split(":"))
+                    sleep_secs = _seconds_until(h, m, weekdays_only=True)
+                else:
+                    logger.error(f"[{name}] CRON '{task.name}': unknown schedule '{task.schedule}'")
+                    return
+            except (ValueError, IndexError) as e:
+                logger.error(f"[{name}] CRON '{task.name}': bad schedule: {e}")
+                return
+
+            logger.info(f"[{name}] CRON '{task.name}': next run in {sleep_secs}s")
+            await asyncio.sleep(sleep_secs)
+
+            # Execute
+            try:
+                logger.info(f"[{name}] CRON '{task.name}': executing")
+                system_prompt = self._build_system_prompt()
+                response = await self._call_claude(
+                    system_prompt,
+                    [{"role": "user", "content": f"[CRON: {task.name}] {task.prompt}"}],
+                )
+
+                slack_text, memory_entries = _extract_and_strip_memory(response)
+                slack_text = _sanitize_for_slack(slack_text)
+                # Strip <nopost/> tag
+                has_nopost = bool(_NOPOST_TAG_RE.search(slack_text))
+                slack_text = _NOPOST_TAG_RE.sub("", slack_text).strip()
+
+                for entry in memory_entries:
+                    _append_memory(self.config.agent_dir, entry)
+
+                _append_daily_log(self.config.agent_dir, f"CRON:{task.name}", slack_text)
+
+                # Decide whether to post
+                should_post = (
+                    task.post == "always"
+                    or (task.post == "conditional" and not has_nopost)
+                )
+                if not should_post or not slack_text or slack_text == "No response from Claude.":
+                    logger.info(f"[{name}] CRON '{task.name}': skipped posting (post={task.post}, nopost={has_nopost})")
+                    continue
+
+                msg_text = f"*[{task.name}]*\n{slack_text}"
+
+                # Post to channel or DM
+                if task.dm:
+                    # Open DM conversation and post
+                    dm_resp = await client.conversations_open(users=[task.dm])
+                    dm_channel = dm_resp["channel"]["id"]
+                    await client.chat_postMessage(channel=dm_channel, text=msg_text)
+                    logger.info(f"[{name}] CRON '{task.name}': DM sent to {task.dm}")
+                elif task.channel:
+                    await client.chat_postMessage(channel=task.channel, text=msg_text)
+                    logger.info(f"[{name}] CRON '{task.name}': posted to #{task.channel}")
+
+            except asyncio.CancelledError:
+                logger.info(f"[{name}] CRON '{task.name}': cancelled")
+                return
+            except Exception as e:
+                logger.error(f"[{name}] CRON '{task.name}': error: {e}")
 
     async def shutdown(self):
         """Graceful shutdown: save state and stop subprocess."""
         name = self.config.name
         agent_dir = self.config.agent_dir
+
+        # Cancel cron tasks
+        for task in getattr(self, "_cron_tasks", []):
+            task.cancel()
 
         # Save conversation summary to daily log
         active_threads = len(self.config.conversation_history)

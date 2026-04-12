@@ -93,6 +93,7 @@ agents/
     ├── SOUL.md       # Persona (required)
     ├── TOOLS.md      # Tools, scripts, references (auto-created if missing)
     ├── MEMORY.md     # Long-term memory (auto-created, agent-managed)
+    ├── CRON.md       # Scheduled tasks (optional)
     ├── scripts/      # Agent-specific scripts
     └── memory/       # Daily conversation logs (auto-created)
         └── 2026-04-12.md
@@ -112,7 +113,35 @@ Each agent has a persistent workspace directory with:
 - **TOOLS.md** — local tools, scripts, API references, workflows
 - **MEMORY.md** — long-term memory across conversations. Agents save memories using `<memory>...</memory>` tags in responses. Tags are stripped before posting to Slack and appended to MEMORY.md. Loaded into system prompt on subprocess start. Capped at `MAX_MEMORY_ENTRIES`.
 - **memory/** — daily conversation logs (`YYYY-MM-DD.md`). User messages and agent responses are auto-logged with timestamps.
+- **CRON.md** — scheduled recurring tasks (optional). Parsed on startup.
 - **scripts/** — agent-specific scripts (optional)
+
+## Scheduled Tasks (CRON.md)
+
+Each agent can have a `CRON.md` to define recurring tasks:
+
+```markdown
+## Morning Briefing
+- schedule: weekdays 09:00
+- dm: U0ARFUDADUJ
+- prompt: Prepare today's morning briefing
+- post: always
+
+## Health Check
+- schedule: every 5m
+- channel: C090L76SYLA
+- prompt: Check system health. If everything is normal, respond with <nopost/>. Only report errors.
+- post: conditional
+```
+
+**Schedule types:** `every 30m`, `every 2h`, `daily 09:00`, `weekdays 08:30`
+
+**Target:** `channel: CHANNEL_ID` (post to channel) or `dm: USER_ID` (DM to user)
+
+**Post modes:**
+- `always` — always post (default)
+- `conditional` — post unless agent returns `<nopost/>` (e.g. only report errors)
+- `silent` — never post to Slack, log only
 
 ## Slack App Setup
 
@@ -144,7 +173,8 @@ Repeat for each agent bot.
 - **Loop prevention**: per-thread response counter capped at `MAX_CHAIN_DEPTH`. Bots ignore their own messages. Stale threads pruned automatically.
 - **Slack formatting**: responses are post-processed to convert markdown to Slack mrkdwn (`**bold**` → `*bold*`, `## Header` → `*Header*`, `[text](url)` → `<url|text>`). Hallucinated XML tags are stripped.
 - **Memory**: `<memory>` tags in responses are extracted, saved to MEMORY.md, and stripped before posting to Slack. Daily conversation logs are written to `memory/YYYY-MM-DD.md`.
-- **Graceful shutdown**: SIGINT/SIGTERM saves session state to daily log and cleanly stops all Claude subprocesses.
+- **Cron scheduler**: `CRON.md` in agent workspace defines recurring tasks. Supports intervals (`every 30m`), fixed times (`daily 09:00`, `weekdays 08:30`), channel/DM targets, and conditional posting (`<nopost/>`).
+- **Graceful shutdown**: SIGINT/SIGTERM cancels cron tasks, saves session state to daily log, and cleanly stops all Claude subprocesses.
 
 ## Running with Supervisor
 
