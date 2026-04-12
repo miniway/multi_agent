@@ -143,6 +143,8 @@ Each agent can have a `CRON.md` to define recurring tasks:
 - `conditional` — post unless agent returns `<nopost/>` (e.g. only report errors)
 - `silent` — never post to Slack, log only
 
+**Enable/disable:** Add `- enabled: false` to pause a task without removing it. Edit CRON.md while running — changes are picked up before each execution, no restart needed.
+
 ## Slack App Setup
 
 Each agent requires its own Slack App with Socket Mode enabled:

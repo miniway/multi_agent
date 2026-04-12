@@ -155,6 +155,7 @@ class CronTask:
     channel: str = ""       # Slack channel ID
     dm: str = ""            # Slack user ID for DM
     post: str = "always"    # always | conditional | silent
+    enabled: bool = True    # false to pause without removing
 
 
 def _parse_interval(spec: str) -> int:
@@ -199,6 +200,7 @@ def _parse_cron_md(path: Path) -> list[CronTask]:
 
     def _save_current():
         if current_name and "schedule" in current and "prompt" in current:
+            enabled_raw = current.get("enabled", "true").strip().lower()
             tasks.append(CronTask(
                 name=current_name,
                 schedule=current["schedule"],
@@ -206,6 +208,7 @@ def _parse_cron_md(path: Path) -> list[CronTask]:
                 channel=current.get("channel", ""),
                 dm=current.get("dm", ""),
                 post=current.get("post", "always"),
+                enabled=enabled_raw not in ("false", "0", "no", "off"),
             ))
 
     for line in content.split("\n"):
@@ -763,16 +766,26 @@ class AgentBot:
         if cron_entries:
             logger.info(f"[{self.config.name}] CRON: {len(cron_entries)} tasks loaded")
             for entry in cron_entries:
+                target = entry.channel or entry.dm or "log-only"
+                status = "enabled" if entry.enabled else "DISABLED"
                 task = asyncio.create_task(self._run_cron(entry, client))
                 self._cron_tasks.append(task)
-                target = entry.channel or entry.dm or "log-only"
                 logger.info(
                     f"[{self.config.name}] CRON: '{entry.name}' ({entry.schedule})"
-                    f" → {target} [post={entry.post}]"
+                    f" → {target} [post={entry.post}, {status}]"
                 )
 
         self.handler = AsyncSocketModeHandler(self.app, self.config.app_token)
         await self.handler.start_async()
+
+    def _is_cron_enabled(self, task_name: str) -> bool:
+        """Re-read CRON.md and check if a task is currently enabled."""
+        cron_file = self.config.agent_dir / "CRON.md"
+        tasks = _parse_cron_md(cron_file)
+        for t in tasks:
+            if t.name == task_name:
+                return t.enabled
+        return False  # task removed from CRON.md
 
     async def _run_cron(self, task: CronTask, client: AsyncWebClient):
         """Run a single cron task on its schedule."""
@@ -803,6 +816,11 @@ class AgentBot:
 
             logger.info(f"[{name}] CRON '{task.name}': next run in {sleep_secs}s")
             await asyncio.sleep(sleep_secs)
+
+            # Check enabled status from CRON.md (hot-reload)
+            if not self._is_cron_enabled(task.name):
+                logger.info(f"[{name}] CRON '{task.name}': disabled, skipping execution")
+                continue
 
             # Execute
             try:
