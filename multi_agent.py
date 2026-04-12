@@ -53,7 +53,6 @@ CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "120"))  # seconds
 
 # Loop prevention
 MAX_CHAIN_DEPTH = int(os.environ.get("MAX_CHAIN_DEPTH", "10"))
-COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "2.0"))
 
 # Memory tag pattern
 _MEMORY_TAG_RE = re.compile(r"<memory>(.*?)</memory>", re.DOTALL)
@@ -405,6 +404,16 @@ class AgentBot:
         # Per-thread bot response counter (loop prevention)
         self._thread_counter: dict[str, int] = {}
 
+        # Cache: team info string (doesn't change at runtime)
+        self._team_info = "\n".join(
+            f"- @{a.name}: {a.soul[:200].split(chr(10))[0] if a.soul else '(role undefined)'}"
+            for a in self.all_agents
+            if a.name != self.config.name
+        )
+
+        # Cache: resolved user display names
+        self._user_name_cache: dict[str, str] = {}
+
         self._register_handlers()
 
     def _register_handlers(self):
@@ -497,6 +506,13 @@ class AgentBot:
 
         asyncio.create_task(self._safe_reaction(client, "remove", channel, event["ts"]))
 
+        # Prune stale threads (keep last 100 active threads)
+        if len(self._thread_counter) > 200:
+            oldest = sorted(self._thread_counter)[:100]
+            for k in oldest:
+                self._thread_counter.pop(k, None)
+                self.config.conversation_history.pop(k, None)
+
         logger.info(
             f"[{self.config.name}] Timing: mention_resolve={t1-t0:.1f}s, "
             f"claude={t3-t2:.1f}s, slack_post={t4-t3:.1f}s, total={t4-t0:.1f}s"
@@ -507,12 +523,6 @@ class AgentBot:
         """Build system prompt from SOUL.md + TOOLS.md + MEMORY.md + team context"""
 
         memory_content = _load_file(self.config.agent_dir / "MEMORY.md")
-
-        team_info = "\n".join(
-            f"- @{a.name}: {a.soul[:200].split(chr(10))[0] if a.soul else '(role undefined)'}"
-            for a in self.all_agents
-            if a.name != self.config.name
-        )
 
         parts = [self.config.soul]
 
@@ -525,7 +535,7 @@ class AgentBot:
         parts.append(f"""
 ---
 ## Team Members (communicate via @mention on Slack)
-{team_info}
+{self._team_info}
 
 ## System Rules
 - When requesting work from another agent, always use @AgentName format.
@@ -570,20 +580,24 @@ class AgentBot:
         """Resolve <@U12345> mentions to display names"""
         mentions = re.findall(r"<@(U[A-Z0-9]+)>", text)
         for user_id in mentions:
-            agent_name = None
-            for a in self.all_agents:
-                if a.bot_user_id == user_id:
-                    agent_name = a.name
-                    break
+            if user_id in self._user_name_cache:
+                name = self._user_name_cache[user_id]
+            else:
+                # Check agent list first
+                name = None
+                for a in self.all_agents:
+                    if a.bot_user_id == user_id:
+                        name = a.name
+                        break
+                if not name:
+                    try:
+                        result = await client.users_info(user=user_id)
+                        name = result["user"]["real_name"] or result["user"]["name"]
+                    except Exception:
+                        name = user_id
+                self._user_name_cache[user_id] = name
 
-            if not agent_name:
-                try:
-                    result = await client.users_info(user=user_id)
-                    agent_name = result["user"]["real_name"] or result["user"]["name"]
-                except Exception:
-                    agent_name = user_id
-
-            text = text.replace(f"<@{user_id}>", f"@{agent_name}")
+            text = text.replace(f"<@{user_id}>", f"@{name}")
 
         return text
 

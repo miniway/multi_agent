@@ -9,5 +9,15 @@ wheels/
 # Virtual environments
 .venv
 
+# Secrets
+.env
+.env.*
+
 # Agent workspace (SOUL.md, TOOLS.md, MEMORY.md, daily logs)
 agents/
+
+# Logs
+logs/
+
+# Playwright MCP artifacts
+.playwright-mcp/
