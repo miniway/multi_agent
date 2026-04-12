@@ -36,10 +36,20 @@ import anthropic
 # ============================================================
 # Logging
 # ============================================================
+LOG_DIR = Path(os.environ.get("LOG_DIR", "./logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_log_format = "%(asctime)s [%(name)-12s] %(levelname)-7s %(message)s"
+_log_datefmt = "%H:%M:%S"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)-12s] %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
+    format=_log_format,
+    datefmt=_log_datefmt,
+    handlers=[
+        logging.StreamHandler(),  # stderr (console)
+        logging.FileHandler(LOG_DIR / "agent.log", encoding="utf-8"),  # file
+    ],
 )
 logger = logging.getLogger("multi-agent")
 
@@ -50,7 +60,7 @@ MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", "./agents"))
 MAX_MEMORY_ENTRIES = int(os.environ.get("MAX_MEMORY_ENTRIES", "50"))
-CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "120"))  # seconds
+CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "300"))  # seconds
 
 # Loop prevention
 MAX_CHAIN_DEPTH = int(os.environ.get("MAX_CHAIN_DEPTH", "10"))
@@ -219,16 +229,19 @@ else:
     _anthropic_client = None
 
 CLAUDE_CLI = os.environ.get("CLAUDE_CLI", "claude")
-_ALLOWED_TOOLS = os.environ.get(
-    "ALLOWED_TOOLS", "WebSearch,WebFetch,Read"
-).split(",")
+_ALLOWED_TOOLS_RAW = os.environ.get("ALLOWED_TOOLS", "WebSearch,WebFetch,Read")
+_PERMISSION_MODE = os.environ.get("PERMISSION_MODE", "default")
 
 _FAST_CLI_FLAGS = [
     "--settings", '{"hooks":{}}',
     "--disable-slash-commands",
-    "--tools", ",".join(_ALLOWED_TOOLS),
-    "--allowedTools", *_ALLOWED_TOOLS,
+    "--permission-mode", _PERMISSION_MODE,
 ]
+
+if _ALLOWED_TOOLS_RAW.strip().lower() != "default":
+    _ALLOWED_TOOLS = [t.strip() for t in _ALLOWED_TOOLS_RAW.split(",") if t.strip()]
+    _FAST_CLI_FLAGS.extend(["--tools", ",".join(_ALLOWED_TOOLS)])
+    _FAST_CLI_FLAGS.extend(["--allowedTools", *_ALLOWED_TOOLS])
 
 
 def _format_prompt(messages: list[dict]) -> str:
@@ -302,6 +315,7 @@ class PersistentClaude:
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         logger.info(f"[{self.name}] Claude subprocess started (PID: {self.proc.pid})")
+        logger.info(f"[{self.name}] CLI flags: {' '.join(cmd[1:])}")
 
     async def _stop(self) -> None:
         if self._stderr_task:
@@ -366,6 +380,23 @@ class PersistentClaude:
                         continue
 
                     etype = event.get("type", "")
+
+                    # Debug: log all stream events
+                    if etype == "assistant":
+                        # Too verbose — just log a summary
+                        msg = event.get("message", {})
+                        content = msg.get("content", [])
+                        for block in content:
+                            btype = block.get("type", "")
+                            if btype == "tool_use":
+                                logger.info(
+                                    f"[{self.name}] tool_use: {block.get('name', '?')} "
+                                    f"({str(block.get('input', ''))[:100]})"
+                                )
+                            elif btype == "text":
+                                logger.debug(f"[{self.name}] text: {block.get('text', '')[:100]}")
+                    elif etype not in ("system", "result"):
+                        logger.debug(f"[{self.name}] event: {etype}")
 
                     if etype == "result":
                         result = event.get("result", "")
@@ -555,7 +586,9 @@ class AgentBot:
 - Lists: use bullet • or dash -.
 - Keep responses concise and conversational. This is chat, not a document.
 - NEVER output raw XML tags in your response text. Tool calls are handled internally.
-- You have access to WebSearch, WebFetch, and Read tools. Use them when needed.
+- You have full tool access: Bash, Read, Write, Edit, WebSearch, WebFetch, Glob, Grep, Browser, etc.
+- You CAN and SHOULD execute shell commands via Bash tool. NEVER say "I can't run commands" or "직접 실행은 안 됩니다".
+- When asked to run a script, run it immediately with Bash. Do not just show the command — execute it.
 - When presenting tool results, summarize naturally — do not dump raw JSON or XML.
 
 ## Memory

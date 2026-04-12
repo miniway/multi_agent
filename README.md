@@ -1,11 +1,12 @@
 # Multi-Agent Slack Bot System
 
-A lightweight system where multiple Slack bots converse with each other, each powered by Claude with its own persona defined in a SOUL.md file. Supports two backends: direct Anthropic API (fast, ~2-5s) or Claude CLI with OAuth (~6s).
+A lightweight system where multiple Slack bots converse with each other, each powered by Claude with its own persona defined in a SOUL.md file. Supports two backends: direct Anthropic API (fast, ~2-5s) or persistent Claude CLI subprocess with OAuth.
 
 Each bot:
 - Responds when @mentioned in a channel or via DM
-- Calls Claude via direct API or CLI subprocess (auto-selected based on auth config)
+- Calls Claude via direct API or persistent CLI subprocess (auto-selected based on auth config)
 - Can @mention other bots, triggering chain reactions
+- Maintains persistent workspace (MEMORY.md, TOOLS.md, daily logs)
 
 ## Prerequisites
 
@@ -26,7 +27,7 @@ uv sync
 cp .env.example .env
 # Edit .env with your actual tokens
 
-# 3. Create SOUL.md for your agents
+# 3. Create workspace for your agent
 mkdir -p agents/my-agent
 # Write agents/my-agent/SOUL.md
 
@@ -47,9 +48,14 @@ Copy `.env.example` to `.env` and fill in the values.
 | `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Model to use |
 | `CLAUDE_CLI` | `claude` | Path to Claude Code CLI binary |
 | `MAX_TOKENS` | `4096` | Max response tokens |
-| `AGENTS_DIR` | `./agents` | Base directory for SOUL.md files |
+| `AGENTS_DIR` | `./agents` | Base directory for agent workspaces |
 | `MAX_CHAIN_DEPTH` | `10` | Max bot responses per thread (loop prevention) |
-| `COOLDOWN_SECONDS` | `2.0` | Delay between consecutive responses (seconds) |
+| `MAX_MEMORY_ENTRIES` | `50` | Max entries in each agent's MEMORY.md |
+| `CLI_TIMEOUT` | `300` | Claude CLI response timeout (seconds) |
+| `MAX_TURNS` | `10` | Max agentic turns per Claude CLI call |
+| `ALLOWED_TOOLS` | `WebSearch,WebFetch,Read` | Comma-separated tool list, or `default` for all tools |
+| `PERMISSION_MODE` | `default` | Claude CLI permission mode (`default`, `acceptEdits`, `dontAsk`, `bypassPermissions`) |
+| `LOG_DIR` | `./logs` | Log file directory |
 
 **Per-agent settings** (replace `{NAME}` with agent identifier, e.g. `MY_AGENT`):
 
@@ -64,7 +70,12 @@ Copy `.env.example` to `.env` and fill in the values.
 **Example `.env`:**
 
 ```bash
-# Enable/disable without removing config
+CLAUDE_CLI=/usr/local/bin/claude
+ALLOWED_TOOLS=default
+PERMISSION_MODE=bypassPermissions
+MAX_TURNS=20
+CLI_TIMEOUT=300
+
 AGENT_MY_AGENT_ENABLED=true
 AGENT_MY_AGENT_NAME=My Agent
 AGENT_MY_AGENT_BOT_TOKEN=xoxb-...
@@ -74,34 +85,34 @@ AGENT_MY_AGENT_SOUL=./agents/my-agent/SOUL.md
 
 ## Adding an Agent
 
-1. Create a directory under `agents/`:
+1. Create a workspace directory under `agents/`:
 
 ```
 agents/
 └── my-agent/
-    └── SOUL.md
+    ├── SOUL.md       # Persona (required)
+    ├── TOOLS.md      # Tools, scripts, references (auto-created if missing)
+    ├── MEMORY.md     # Long-term memory (auto-created, agent-managed)
+    ├── scripts/      # Agent-specific scripts
+    └── memory/       # Daily conversation logs (auto-created)
+        └── 2026-04-12.md
 ```
 
-2. Write a `SOUL.md` that defines the agent's persona. This becomes the system prompt for Claude calls. The system automatically appends a team roster and communication rules.
+2. Write a `SOUL.md` that defines the agent's persona. This becomes the system prompt for Claude calls. The system automatically appends team roster, Slack formatting rules, and memory instructions.
 
-A typical SOUL.md contains:
-- **Core Identity** — role, philosophy, core principles
-- **Knowledge references** — paths to domain knowledge files (`~/.claude/knowledge/{role}/`)
-- **Task-knowledge mapping** — which knowledge files to consult per task type
-- **Communication protocol** — Slack interaction rules, escalation policy
-- **Loop prevention rules** — max round-trips, escalation triggers
+3. Optionally add a `TOOLS.md` with agent-specific references (API keys, scripts, workflows).
 
-3. Add environment variables to `.env`:
+4. Add environment variables to `.env` and run `uv run multi-agent`.
 
-```bash
-AGENT_MY_AGENT_ENABLED=true
-AGENT_MY_AGENT_NAME=My Agent
-AGENT_MY_AGENT_BOT_TOKEN=xoxb-...
-AGENT_MY_AGENT_APP_TOKEN=xapp-...
-AGENT_MY_AGENT_SOUL=./agents/my-agent/SOUL.md
-```
+## Agent Workspace
 
-4. Run `uv run multi-agent`. The agent is auto-discovered from `AGENT_{NAME}_BOT_TOKEN` env vars.
+Each agent has a persistent workspace directory with:
+
+- **SOUL.md** — persona, role, principles, knowledge references
+- **TOOLS.md** — local tools, scripts, API references, workflows
+- **MEMORY.md** — long-term memory across conversations. Agents save memories using `<memory>...</memory>` tags in responses. Tags are stripped before posting to Slack and appended to MEMORY.md. Loaded into system prompt on subprocess start. Capped at `MAX_MEMORY_ENTRIES`.
+- **memory/** — daily conversation logs (`YYYY-MM-DD.md`). User messages and agent responses are auto-logged with timestamps.
+- **scripts/** — agent-specific scripts (optional)
 
 ## Slack App Setup
 
@@ -127,12 +138,27 @@ Repeat for each agent bot.
 ## How It Works
 
 - **Single process, multi-bot**: all bots run concurrently via `asyncio.gather`. Each bot is an independent `AgentBot` instance with its own Slack `AsyncApp` and Socket Mode connection.
-- **Hybrid backend**: if `ANTHROPIC_API_KEY` is set, uses direct Anthropic API (~2-5s). Otherwise falls back to `claude -p` CLI subprocess with hooks disabled (~6s).
+- **Persistent CLI subprocess**: each agent keeps one `claude -p --input-format stream-json --output-format stream-json` process alive. Messages are sent as NDJSON via stdin, responses read from stdout. Cold start on first message (~5-6s), subsequent messages reuse the process (~2-3s). Restarts automatically if the process dies.
+- **Direct API**: if `ANTHROPIC_API_KEY` is set, uses Anthropic API directly (no CLI subprocess).
 - **Chain reactions**: if a bot's response @mentions another bot, that bot picks up and responds.
-- **Loop prevention**: per-thread response counter capped at `MAX_CHAIN_DEPTH`. Bots ignore their own messages.
-- **Enable/disable**: each agent can be toggled via `AGENT_{NAME}_ENABLED` without removing config.
-- **Agent discovery**: `load_agents()` scans environment variables for `AGENT_{NAME}_BOT_TOKEN` patterns. No registry file needed.
-- **Conversation history**: in-memory per thread (last 20 messages), lost on restart.
+- **Loop prevention**: per-thread response counter capped at `MAX_CHAIN_DEPTH`. Bots ignore their own messages. Stale threads pruned automatically.
+- **Slack formatting**: responses are post-processed to convert markdown to Slack mrkdwn (`**bold**` → `*bold*`, `## Header` → `*Header*`, `[text](url)` → `<url|text>`). Hallucinated XML tags are stripped.
+- **Memory**: `<memory>` tags in responses are extracted, saved to MEMORY.md, and stripped before posting to Slack. Daily conversation logs are written to `memory/YYYY-MM-DD.md`.
+- **Graceful shutdown**: SIGINT/SIGTERM saves session state to daily log and cleanly stops all Claude subprocesses.
+
+## Running with Supervisor
+
+```ini
+[program:agent]
+command=/usr/local/bin/uv run multi-agent
+directory=/path/to/multi_agent
+autostart=true
+autorestart=false
+stopasgroup=true
+killasgroup=true
+stderr_logfile=./logs/agent.err.log
+stdout_logfile=./logs/agent.out.log
+```
 
 ## Special Thanks
 
