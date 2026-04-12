@@ -19,6 +19,7 @@ import os
 import re
 import asyncio
 import logging
+import signal
 import time
 from datetime import date
 from pathlib import Path
@@ -625,6 +626,27 @@ class AgentBot:
         self.handler = AsyncSocketModeHandler(self.app, self.config.app_token)
         await self.handler.start_async()
 
+    async def shutdown(self):
+        """Graceful shutdown: save state and stop subprocess."""
+        name = self.config.name
+        agent_dir = self.config.agent_dir
+
+        # Save conversation summary to daily log
+        active_threads = len(self.config.conversation_history)
+        total_msgs = sum(len(v) for v in self.config.conversation_history.values())
+        if total_msgs > 0:
+            _append_daily_log(
+                agent_dir, "SYSTEM",
+                f"Shutdown: {active_threads} threads, {total_msgs} messages in memory"
+            )
+
+        # Stop persistent Claude subprocess
+        if self._claude:
+            await self._claude._stop()
+            logger.info(f"[{name}] Claude subprocess stopped")
+
+        logger.info(f"[{name}] Shutdown complete")
+
 
 # ============================================================
 # Main
@@ -658,9 +680,25 @@ async def main():
 
     bots = [AgentBot(config=agent, all_agents=agents) for agent in agents]
 
+    # Graceful shutdown handler
+    async def _shutdown(sig_name: str):
+        logger.info(f"Received {sig_name}, shutting down...")
+        await asyncio.gather(*[bot.shutdown() for bot in bots])
+        logger.info("All agents stopped. Goodbye.")
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(
+            sig,
+            lambda s=sig: asyncio.create_task(_shutdown(s.name)),
+        )
+
     logger.info("Starting all bots...")
     await asyncio.gather(*[bot.start() for bot in bots])
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
