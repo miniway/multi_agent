@@ -5,8 +5,9 @@ A lightweight system where Slack bots converse with each other.
 
 Each bot:
 - Responds when @mentioned
-- Calls Claude via CLI subprocess based on its role defined in SOUL.md
+- Calls Claude via persistent CLI subprocess or direct API
 - Posts responses to Slack channel (may @mention other bots -> chain reaction)
+- Maintains persistent workspace (MEMORY.md, TOOLS.md, daily logs)
 
 Usage:
   1. Configure tokens in .env
@@ -19,6 +20,7 @@ import re
 import asyncio
 import logging
 import time
+from datetime import date
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -29,7 +31,6 @@ from slack_sdk.web.async_client import AsyncWebClient
 import json as _json
 
 import anthropic
-from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
 
 # ============================================================
 # Logging
@@ -47,10 +48,90 @@ logger = logging.getLogger("multi-agent")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", "./agents"))
+MAX_MEMORY_ENTRIES = int(os.environ.get("MAX_MEMORY_ENTRIES", "50"))
+CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "120"))  # seconds
 
 # Loop prevention
-MAX_CHAIN_DEPTH = int(os.environ.get("MAX_CHAIN_DEPTH", "10"))  # Max bot responses per thread
-COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "2.0"))  # Delay between responses
+MAX_CHAIN_DEPTH = int(os.environ.get("MAX_CHAIN_DEPTH", "10"))
+COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "2.0"))
+
+# Memory tag pattern
+_MEMORY_TAG_RE = re.compile(r"<memory>(.*?)</memory>", re.DOTALL)
+# XML junk patterns (hallucinated tool calls, etc.)
+_XML_JUNK_RE = re.compile(
+    r"<(?:tool_use|tool_name|tool_parameters|tool_function_result|function_call|result)>.*?"
+    r"</(?:tool_use|tool_name|tool_parameters|tool_function_result|function_call|result)>",
+    re.DOTALL,
+)
+
+
+# ============================================================
+# Agent Workspace
+# ============================================================
+def _ensure_workspace(agent_dir: Path) -> None:
+    """Ensure agent workspace directories and files exist."""
+    (agent_dir / "memory").mkdir(parents=True, exist_ok=True)
+
+    for fname in ("MEMORY.md", "TOOLS.md"):
+        fpath = agent_dir / fname
+        if not fpath.exists():
+            fpath.write_text("", encoding="utf-8")
+
+
+def _load_file(path: Path) -> str:
+    """Load file content, return empty string if missing."""
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def _append_memory(agent_dir: Path, entry: str) -> None:
+    """Append an entry to MEMORY.md, keeping max entries."""
+    memory_file = agent_dir / "MEMORY.md"
+    timestamp = time.strftime("%Y-%m-%d %H:%M")
+
+    existing = _load_file(memory_file)
+    lines = [l for l in existing.split("\n") if l.strip()] if existing else []
+    lines.append(f"- [{timestamp}] {entry.strip()}")
+
+    if len(lines) > MAX_MEMORY_ENTRIES:
+        lines = lines[-MAX_MEMORY_ENTRIES:]
+
+    memory_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _append_daily_log(agent_dir: Path, role: str, content: str) -> None:
+    """Append to today's daily log file."""
+    today = date.today().isoformat()
+    log_file = agent_dir / "memory" / f"{today}.md"
+
+    timestamp = time.strftime("%H:%M")
+    entry = f"**[{timestamp}] {role}**: {content[:500]}\n\n"
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(entry)
+
+
+def _extract_and_strip_memory(text: str) -> tuple[str, list[str]]:
+    """Extract <memory> tags from response. Returns (cleaned_text, memory_entries)."""
+    entries = _MEMORY_TAG_RE.findall(text)
+    cleaned = _MEMORY_TAG_RE.sub("", text).strip()
+    return cleaned, entries
+
+
+def _sanitize_for_slack(text: str) -> str:
+    """Remove hallucinated XML tags and convert to Slack mrkdwn."""
+    text = _XML_JUNK_RE.sub("", text)
+    # **bold** → *bold* (Slack mrkdwn)
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    # ### Header → *Header* (Slack has no headers)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    # [text](url) → <url|text> (Slack link format)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+    # Collapse multiple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 
 # ============================================================
 # Agent Definition
@@ -58,31 +139,20 @@ COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "2.0"))  # Delay bet
 @dataclass
 class AgentConfig:
     """One Slack Bot = One Agent"""
-    name: str                    # Display name (e.g. "FRIDAY")
-    bot_token: str               # xoxb-...
-    app_token: str               # xapp-...
-    soul_path: Path              # Path to SOUL.md
-    bot_user_id: str = ""        # Set at runtime
-    soul: str = ""               # SOUL.md content (loaded at runtime)
-    conversation_history: dict = field(default_factory=dict)  # channel_id -> messages
+    name: str
+    bot_token: str
+    app_token: str
+    agent_dir: Path
+    bot_user_id: str = ""
+    soul: str = ""
+    tools: str = ""
+    conversation_history: dict = field(default_factory=dict)
 
 
 def load_agents() -> list[AgentConfig]:
-    """
-    Load agent configurations from environment variables.
-
-    Env var pattern:
-      AGENT_FRIDAY_BOT_TOKEN=xoxb-...
-      AGENT_FRIDAY_APP_TOKEN=xapp-...
-      AGENT_FRIDAY_SOUL=./agents/friday/SOUL.md
-
-      AGENT_BLACK_WIDOW_BOT_TOKEN=xoxb-...
-      AGENT_BLACK_WIDOW_APP_TOKEN=xapp-...
-      AGENT_BLACK_WIDOW_SOUL=./agents/black-widow/SOUL.md
-    """
+    """Load agent configurations from environment variables."""
     agents = []
 
-    # Find AGENT_*_BOT_TOKEN patterns in env vars
     agent_names = set()
     for key in os.environ:
         match = re.match(r"AGENT_(.+)_BOT_TOKEN", key)
@@ -90,7 +160,6 @@ def load_agents() -> list[AgentConfig]:
             agent_names.add(match.group(1))
 
     for name_key in sorted(agent_names):
-        # Check enabled flag (default: true)
         enabled = os.environ.get(f"AGENT_{name_key}_ENABLED", "true").lower()
         if enabled in ("false", "0", "no", "off"):
             logger.info(f"Agent {name_key}: disabled, skipping")
@@ -112,29 +181,36 @@ def load_agents() -> list[AgentConfig]:
             continue
 
         soul_path = Path(soul_file)
-        soul_content = ""
-        if soul_path.exists():
-            soul_content = soul_path.read_text(encoding="utf-8")
+        agent_dir = soul_path.parent
+
+        _ensure_workspace(agent_dir)
+
+        soul_content = _load_file(soul_path)
+        tools_content = _load_file(agent_dir / "TOOLS.md")
+
+        if soul_content:
             logger.info(f"Agent {display_name}: SOUL.md loaded ({len(soul_content)} chars)")
         else:
             logger.warning(f"Agent {display_name}: SOUL.md not found ({soul_path})")
+
+        if tools_content:
+            logger.info(f"Agent {display_name}: TOOLS.md loaded ({len(tools_content)} chars)")
 
         agents.append(AgentConfig(
             name=display_name,
             bot_token=bot_token,
             app_token=app_token,
-            soul_path=soul_path,
+            agent_dir=agent_dir,
             soul=soul_content,
+            tools=tools_content,
         ))
 
     return agents
 
 
 # ============================================================
-# Claude Backend (hybrid: Anthropic API or claude-agent-sdk)
+# Claude Backend
 # ============================================================
-# ANTHROPIC_API_KEY → direct API (~2-5s, fast)
-# CLAUDE_CODE_OAUTH_TOKEN → claude-agent-sdk subprocess (~6s with optimised CLI flags)
 USE_DIRECT_API = bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 if USE_DIRECT_API:
@@ -143,11 +219,15 @@ else:
     _anthropic_client = None
 
 CLAUDE_CLI = os.environ.get("CLAUDE_CLI", "claude")
+_ALLOWED_TOOLS = os.environ.get(
+    "ALLOWED_TOOLS", "WebSearch,WebFetch,Read"
+).split(",")
+
 _FAST_CLI_FLAGS = [
     "--settings", '{"hooks":{}}',
-    "--setting-sources", "",
     "--disable-slash-commands",
-    "--allowedTools", "",
+    "--tools", ",".join(_ALLOWED_TOOLS),
+    "--allowedTools", *_ALLOWED_TOOLS,
 ]
 
 
@@ -182,74 +262,126 @@ async def _call_claude_api(system_prompt: str, messages: list[dict]) -> str:
         return f"API call failed: {str(e)[:200]}"
 
 
-CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "120"))  # seconds
+# ============================================================
+# Persistent Claude CLI Subprocess (stream-json protocol)
+# ============================================================
+class PersistentClaude:
+    """Persistent Claude CLI subprocess per agent.
 
-
-async def _call_claude_sdk(system_prompt: str, messages: list[dict]) -> str:
-    """Call Claude via claude-agent-sdk (uses CLAUDE_CODE_OAUTH_TOKEN).
-
-    Sends prompt via stdin to avoid arg length limits. Timeout prevents hangs.
+    Uses `-p --input-format stream-json --output-format stream-json` to keep
+    one process alive. Messages are sent as NDJSON via stdin, responses read
+    as stream-json events from stdout. Restarts when system prompt changes
+    (e.g. MEMORY.md updated) or process dies.
     """
-    prompt = _format_prompt(messages)
-    cmd = [
-        CLAUDE_CLI, "-p",
-        "--model", MODEL,
-        "--system-prompt", system_prompt,
-        "--output-format", "json",
-        "--max-turns", "1",
-        *_FAST_CLI_FLAGS,
-    ]
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
+    def __init__(self, name: str):
+        self.name = name
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self._lock = asyncio.Lock()
+        self._stderr_task: Optional[asyncio.Task] = None
+
+    async def _start(self, system_prompt: str) -> None:
+        await self._stop()
+
+        cmd = [
+            CLAUDE_CLI, "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", MODEL,
+            "--system-prompt", system_prompt,
+            "--max-turns", os.environ.get("MAX_TURNS", "10"),
+            *_FAST_CLI_FLAGS,
+        ]
+
+        self.proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode()),
-            timeout=CLI_TIMEOUT,
-        )
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        logger.info(f"[{self.name}] Claude subprocess started (PID: {self.proc.pid})")
 
-        raw = stdout.decode()
-        if proc.returncode != 0:
-            err = stderr.decode().strip()
-            logger.error(f"Claude CLI error (exit {proc.returncode}) stderr: {err}")
-            # Try to extract result even from error responses (e.g. max_turns)
+    async def _stop(self) -> None:
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
             try:
-                data = _json.loads(raw)
-                if data.get("result"):
-                    return data["result"]
-            except _json.JSONDecodeError:
-                pass
-            logger.error(f"Claude CLI error stdout: {raw[:500]}")
-            return f"CLI error (exit {proc.returncode}): {err or 'see logs'}"
+                await asyncio.wait_for(self.proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+        self.proc = None
 
+    async def _drain_stderr(self) -> None:
         try:
-            data = _json.loads(raw)
-        except _json.JSONDecodeError:
-            logger.error(f"Claude CLI returned invalid JSON: {raw[:500]}")
-            return "CLI returned invalid response."
-        return data.get("result", "") or "No response from Claude."
-    except asyncio.TimeoutError:
-        proc.kill()
-        logger.error(f"Claude CLI timed out after {CLI_TIMEOUT}s")
-        return f"CLI timed out after {CLI_TIMEOUT}s"
-    except Exception as e:
-        logger.error(f"Claude CLI error: {e}")
-        return f"CLI call failed: {str(e)[:200]}"
+            while self.proc and self.proc.returncode is None:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    break
+                msg = line.decode().strip()
+                if msg:
+                    logger.debug(f"[{self.name}] cli stderr: {msg}")
+        except asyncio.CancelledError:
+            pass
 
+    def _is_alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
 
-async def call_claude(system_prompt: str, messages: list[dict]) -> str:
-    """Call Claude using the best available backend.
+    async def send(self, message: str, system_prompt: str) -> str:
+        async with self._lock:
+            if not self._is_alive():
+                logger.info(f"[{self.name}] Starting subprocess")
+                await self._start(system_prompt)
 
-    ANTHROPIC_API_KEY set → direct Anthropic API (~2-5s)
-    Otherwise → claude CLI subprocess with OAuth (~6s)
-    """
-    if USE_DIRECT_API:
-        return await _call_claude_api(system_prompt, messages)
-    return await _call_claude_sdk(system_prompt, messages)
+            # Send NDJSON user message
+            msg = _json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": message},
+            })
+            self.proc.stdin.write((msg + "\n").encode())
+            await self.proc.stdin.drain()
+
+            # Read stream-json events until result
+            try:
+                while True:
+                    raw = await asyncio.wait_for(
+                        self.proc.stdout.readline(),
+                        timeout=CLI_TIMEOUT,
+                    )
+                    if not raw:
+                        logger.warning(f"[{self.name}] Subprocess stdout closed")
+                        self.proc = None
+                        return "Claude process exited unexpectedly"
+
+                    line = raw.decode().strip()
+                    if not line:
+                        continue
+
+                    try:
+                        event = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type", "")
+
+                    if etype == "result":
+                        result = event.get("result", "")
+                        if event.get("is_error"):
+                            logger.warning(
+                                f"[{self.name}] Claude error: "
+                                f"{event.get('subtype', 'unknown')}"
+                            )
+                        return result or "No response from Claude."
+
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[{self.name}] Timed out after {CLI_TIMEOUT}s, restarting"
+                )
+                await self._stop()
+                return f"Timed out after {CLI_TIMEOUT}s"
 
 
 # ============================================================
@@ -260,10 +392,15 @@ class AgentBot:
 
     def __init__(self, config: AgentConfig, all_agents: list[AgentConfig]):
         self.config = config
-        self.all_agents = all_agents  # Other bots info (for mention mapping)
+        self.all_agents = all_agents
 
         self.app = AsyncApp(token=config.bot_token)
         self.handler: Optional[AsyncSocketModeHandler] = None
+
+        # Persistent Claude subprocess (CLI mode only)
+        self._claude: Optional[PersistentClaude] = None
+        if not USE_DIRECT_API:
+            self._claude = PersistentClaude(config.name)
 
         # Per-thread bot response counter (loop prevention)
         self._thread_counter: dict[str, int] = {}
@@ -279,17 +416,24 @@ class AgentBot:
 
         @self.app.event("message")
         async def handle_message(event, say, client):
-            # Only handle DMs (channel messages use app_mention)
             if event.get("channel_type") == "im":
                 await self._handle_message(event, say, client)
 
         @self.app.event("reaction_added")
         async def handle_reaction_added(event, logger):
-            pass  # Acknowledge but ignore
+            pass
 
         @self.app.event("reaction_removed")
         async def handle_reaction_removed(event, logger):
-            pass  # Acknowledge but ignore
+            pass
+
+    async def _call_claude(self, system_prompt: str, messages: list[dict]) -> str:
+        """Call Claude using the best available backend."""
+        if USE_DIRECT_API:
+            return await _call_claude_api(system_prompt, messages)
+
+        prompt = _format_prompt(messages)
+        return await self._claude.send(prompt, system_prompt)
 
     async def _handle_message(self, event: dict, say, client: AsyncWebClient):
         """Main message handling logic"""
@@ -299,15 +443,12 @@ class AgentBot:
         channel = event.get("channel", "")
         thread_ts = event.get("thread_ts", event.get("ts", ""))
 
-        # Ignore own messages
         if user == self.config.bot_user_id:
             return
 
-        # Ignore own bot_message subtype (allow other bots)
         if event.get("bot_id") and event.get("bot_id") == await self._get_own_bot_id(client):
             return
 
-        # Loop prevention: limit responses per thread
         counter_key = f"{channel}:{thread_ts}"
         self._thread_counter[counter_key] = self._thread_counter.get(counter_key, 0) + 1
         if self._thread_counter[counter_key] > MAX_CHAIN_DEPTH:
@@ -316,16 +457,13 @@ class AgentBot:
 
         t0 = time.monotonic()
 
-        # Typing indicator (non-blocking)
-        asyncio.create_task(
-            client.reactions_add(channel=channel, name="eyes", timestamp=event["ts"])
-        )
+        asyncio.create_task(self._safe_reaction(client, "add", channel, event["ts"]))
 
-        # Resolve @mentions to display names
         readable_text = await self._resolve_mentions(text, client)
         t1 = time.monotonic()
 
-        # Build conversation history
+        _append_daily_log(self.config.agent_dir, "User", readable_text)
+
         history_key = f"{channel}:{thread_ts}"
         if history_key not in self.config.conversation_history:
             self.config.conversation_history[history_key] = []
@@ -333,54 +471,58 @@ class AgentBot:
         history = self.config.conversation_history[history_key]
         history.append({"role": "user", "content": readable_text})
 
-        # Keep only last 20 messages
         if len(history) > 20:
             history = history[-20:]
             self.config.conversation_history[history_key] = history
 
-        # Build system prompt
         system_prompt = self._build_system_prompt()
 
-        # Call Claude via agent SDK
         logger.info(f"[{self.config.name}] Calling Claude: {readable_text[:80]}...")
         t2 = time.monotonic()
-        response_text = await call_claude(system_prompt, history)
+        response_text = await self._call_claude(system_prompt, history)
         t3 = time.monotonic()
 
-        # Append response to history
-        history.append({"role": "assistant", "content": response_text})
+        slack_text, memory_entries = _extract_and_strip_memory(response_text)
+        slack_text = _sanitize_for_slack(slack_text)
+        for entry in memory_entries:
+            _append_memory(self.config.agent_dir, entry)
+            logger.info(f"[{self.config.name}] Memory saved: {entry[:80]}")
 
-        # Send response to Slack (directly in channel, not as thread reply)
-        await say(
-            text=response_text,
-            channel=channel,
-        )
+        _append_daily_log(self.config.agent_dir, self.config.name, slack_text)
+
+        history.append({"role": "assistant", "content": slack_text})
+
+        await say(text=slack_text, channel=channel)
         t4 = time.monotonic()
 
-        # Remove typing reaction (non-blocking)
-        asyncio.create_task(
-            client.reactions_remove(channel=channel, name="eyes", timestamp=event["ts"])
-        )
+        asyncio.create_task(self._safe_reaction(client, "remove", channel, event["ts"]))
 
         logger.info(
             f"[{self.config.name}] Timing: mention_resolve={t1-t0:.1f}s, "
             f"claude={t3-t2:.1f}s, slack_post={t4-t3:.1f}s, total={t4-t0:.1f}s"
         )
-
-        logger.info(f"[{self.config.name}] Response sent ({len(response_text)} chars)")
+        logger.info(f"[{self.config.name}] Response sent ({len(slack_text)} chars)")
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt from SOUL.md + team context"""
+        """Build system prompt from SOUL.md + TOOLS.md + MEMORY.md + team context"""
 
-        # Other agents info
+        memory_content = _load_file(self.config.agent_dir / "MEMORY.md")
+
         team_info = "\n".join(
             f"- @{a.name}: {a.soul[:200].split(chr(10))[0] if a.soul else '(role undefined)'}"
             for a in self.all_agents
             if a.name != self.config.name
         )
 
-        return f"""{self.config.soul}
+        parts = [self.config.soul]
 
+        if self.config.tools:
+            parts.append(f"\n---\n## TOOLS.md\n{self.config.tools}")
+
+        if memory_content:
+            parts.append(f"\n---\n## Long-Term Memory\n{memory_content}")
+
+        parts.append(f"""
 ---
 ## Team Members (communicate via @mention on Slack)
 {team_info}
@@ -389,13 +531,45 @@ class AgentBot:
 - When requesting work from another agent, always use @AgentName format.
 - Do not @mention yourself.
 - Escalate to Boss after {MAX_CHAIN_DEPTH}+ round-trips in a thread.
-"""
+
+## Slack Formatting (MUST follow)
+- You are responding in Slack. Use Slack mrkdwn, NOT standard Markdown.
+- Bold: *bold* (single asterisk). NEVER use **double asterisk** — Slack does not render it as bold.
+- Italic: _italic_ (underscore).
+- Strikethrough: ~text~.
+- Code inline: `code` (same as markdown).
+- Code block: ```code``` (same as markdown).
+- NO markdown headers (# ## ###). Use *bold text* on its own line instead.
+- NO markdown links [text](url). Use bare URLs or Slack format <url|text>.
+- Lists: use bullet • or dash -.
+- Keep responses concise and conversational. This is chat, not a document.
+- NEVER output raw XML tags in your response text. Tool calls are handled internally.
+- You have access to WebSearch, WebFetch, and Read tools. Use them when needed.
+- When presenting tool results, summarize naturally — do not dump raw JSON or XML.
+
+## Memory
+- To remember something across conversations, wrap it in <memory>...</memory> tags in your response.
+- The tagged content will be saved to your long-term memory and stripped before sending to Slack.
+- Example: <memory>Boss prefers daily standups at 10am</memory>
+- Only memorize important facts, decisions, preferences — not routine conversation.
+""")
+
+        return "\n".join(parts)
+
+    async def _safe_reaction(self, client: AsyncWebClient, action: str, channel: str, ts: str):
+        """Add/remove reaction, silently ignore errors."""
+        try:
+            if action == "add":
+                await client.reactions_add(channel=channel, name="eyes", timestamp=ts)
+            else:
+                await client.reactions_remove(channel=channel, name="eyes", timestamp=ts)
+        except Exception:
+            pass
 
     async def _resolve_mentions(self, text: str, client: AsyncWebClient) -> str:
         """Resolve <@U12345> mentions to display names"""
         mentions = re.findall(r"<@(U[A-Z0-9]+)>", text)
         for user_id in mentions:
-            # Look up in our agents first
             agent_name = None
             for a in self.all_agents:
                 if a.bot_user_id == user_id:
@@ -446,34 +620,30 @@ async def main():
     logger.info("Multi-Agent Slack Bot System")
     logger.info("=" * 60)
 
-    # Validate Claude credentials (claude-agent-sdk accepts either)
     if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         logger.error("Set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN environment variable")
         return
 
     if USE_DIRECT_API:
-        logger.info("Claude backend: Anthropic API (fast, direct)")
+        logger.info("Claude backend: Anthropic API (direct)")
     else:
-        logger.info("Claude backend: Claude CLI subprocess (OAuth)")
+        logger.info("Claude backend: Persistent CLI subprocess (OAuth)")
 
-    # Load agents
     agents = load_agents()
     if not agents:
         logger.error("No agents found. Check your environment variables.")
         logger.info("Required env var pattern:")
-        logger.info("  AGENT_FRIDAY_BOT_TOKEN=xoxb-...")
-        logger.info("  AGENT_FRIDAY_APP_TOKEN=xapp-...")
-        logger.info("  AGENT_FRIDAY_SOUL=./agents/friday/SOUL.md")
+        logger.info("  AGENT_{NAME}_BOT_TOKEN=xoxb-...")
+        logger.info("  AGENT_{NAME}_APP_TOKEN=xapp-...")
+        logger.info("  AGENT_{NAME}_SOUL=./agents/{name}/SOUL.md")
         return
 
     logger.info(f"Agents loaded: {len(agents)}")
     for a in agents:
-        logger.info(f"  - {a.name} (SOUL: {'OK' if a.soul else 'MISSING'})")
+        logger.info(f"  - {a.name} (SOUL: {'OK' if a.soul else 'MISSING'}, TOOLS: {'OK' if a.tools else '-'})")
 
-    # Create bot instances
     bots = [AgentBot(config=agent, all_agents=agents) for agent in agents]
 
-    # Start all bots concurrently
     logger.info("Starting all bots...")
     await asyncio.gather(*[bot.start() for bot in bots])
 
