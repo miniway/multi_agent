@@ -147,24 +147,15 @@ Each agent can have a `CRON.md` to define recurring tasks:
 
 ## Slack App Setup
 
-Each agent requires its own Slack App with Socket Mode enabled:
+Each agent requires its own Slack App with Socket Mode enabled. See the **[detailed setup guide](docs/slack-app-setup.md)** with app manifest, scopes reference, and troubleshooting.
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app
-2. Enable **Socket Mode** (Settings > Socket Mode) — copy the App-Level Token (`xapp-...`)
-3. Add **Bot Token Scopes** (OAuth & Permissions):
-   - `app_mentions:read`
-   - `chat:write`
-   - `im:history`
-   - `reactions:read`
-   - `reactions:write`
-   - `users:read`
-4. Enable **Event Subscriptions** and subscribe to:
-   - `app_mention`
-   - `message.im`
-5. Install the app to your workspace — copy the Bot Token (`xoxb-...`)
-6. Set the tokens in `.env`
+Quick summary:
+1. Create a Slack App **from manifest** at [api.slack.com/apps](https://api.slack.com/apps)
+2. Copy **Bot Token** (`xoxb-...`) from OAuth & Permissions
+3. Generate **App-Level Token** (`xapp-...`) with `connections:write` scope
+4. Add tokens to `.env`
 
-Repeat for each agent bot.
+Repeat for each agent.
 
 ## How It Works
 
