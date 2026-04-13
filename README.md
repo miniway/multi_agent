@@ -185,4 +185,5 @@ stdout_logfile=./logs/agent.out.log
 
 ## Special Thanks
 
+- Dylan Ko (고영혁) — general idea and inspiration
 - [juchanhwang/my-harness](https://github.com/juchanhwang/my-harness) — agent persona definitions
