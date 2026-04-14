@@ -69,6 +69,14 @@ Step-by-step guide to create a Slack bot for the Multi-Agent system.
         "interactivity": {
             "is_enabled": true
         },
+        "slash_commands": [
+            {
+                "command": "/cron",
+                "description": "Manage scheduled tasks (list, add, enable, disable, delete)",
+                "usage_hint": "list | add name | schedule | target | prompt | show <name> | enable <name> | disable <name> | delete <name>",
+                "should_escape": false
+            }
+        ],
         "org_deploy_enabled": false,
         "socket_mode_enabled": true,
         "token_rotation_enabled": false

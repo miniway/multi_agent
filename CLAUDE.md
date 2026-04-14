@@ -70,5 +70,6 @@ All config is via environment variables (see `.env`):
 - **Long-term memory**: `<memory>` tags in responses are extracted, saved to MEMORY.md, stripped before Slack. Loaded into system prompt on subprocess start.
 - **Slack mrkdwn**: Post-processing converts `**bold**` → `*bold*`, `## Header` → `*Header*`, `[text](url)` → `<url|text>`, strips XML junk.
 - **Cron scheduler**: `CRON.md` parsed at startup → asyncio tasks per schedule. Supports `every Xm/Xh`, `daily HH:MM`, `weekdays HH:MM`. Targets: `channel` or `dm`. Post modes: `always`, `conditional` (suppressed by `<nopost/>` tag), `silent` (log only). `enabled: false` pauses a task. CRON.md is re-read before each execution (hot-reload, no restart needed). Cron responses go through same memory/sanitize pipeline as regular messages.
+- **`/cron` slash command**: CRUD for CRON.md tasks via Slack (`/cron list|show|add|enable|disable|delete`). Requires `commands` scope and `/cron` slash command registered in the Slack App manifest.
 - **Graceful shutdown**: SIGINT/SIGTERM → cancel cron tasks → save session state to daily log → stop all Claude subprocesses.
 - **Supervisor**: Managed via supervisor with `stopasgroup=true` + `killasgroup=true` to prevent zombie processes.

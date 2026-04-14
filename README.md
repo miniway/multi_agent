@@ -145,6 +145,17 @@ Each agent can have a `CRON.md` to define recurring tasks:
 
 **Enable/disable:** Add `- enabled: false` to pause a task without removing it. Edit CRON.md while running — changes are picked up before each execution, no restart needed.
 
+**Slack `/cron` command:** Manage tasks without editing files:
+```
+/cron list                                           — show all tasks
+/cron show <name>                                    — task details
+/cron add name | schedule | target | prompt [| post] — add task
+/cron enable <name>                                  — resume
+/cron disable <name>                                 — pause
+/cron delete <name>                                  — remove
+```
+DM target: use `dm:USER_ID` (e.g. `/cron add Report | daily 18:00 | dm:U0AR... | Send report`)
+
 ## Slack App Setup
 
 Each agent requires its own Slack App with Socket Mode enabled. See the **[detailed setup guide](docs/slack-app-setup.md)** with app manifest, scopes reference, and troubleshooting.

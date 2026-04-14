@@ -225,6 +225,23 @@ def _parse_cron_md(path: Path) -> list[CronTask]:
     return tasks
 
 
+def _write_cron_md(path: Path, tasks: list[CronTask]) -> None:
+    """Write a list of CronTask back to CRON.md."""
+    lines = ["# CRON.md — Scheduled Tasks\n"]
+    for t in tasks:
+        lines.append(f"## {t.name}")
+        lines.append(f"- schedule: {t.schedule}")
+        if t.channel:
+            lines.append(f"- channel: {t.channel}")
+        if t.dm:
+            lines.append(f"- dm: {t.dm}")
+        lines.append(f"- prompt: {t.prompt}")
+        lines.append(f"- post: {t.post}")
+        lines.append(f"- enabled: {'true' if t.enabled else 'false'}")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _extract_and_strip_memory(text: str) -> tuple[str, list[str]]:
     """Extract <memory> tags from response. Returns (cleaned_text, memory_entries)."""
     entries = _MEMORY_TAG_RE.findall(text)
@@ -570,6 +587,138 @@ class AgentBot:
         @self.app.event("reaction_removed")
         async def handle_reaction_removed(event, logger):
             pass
+
+        @self.app.command("/cron")
+        async def handle_cron_command(ack, command, say):
+            await ack()
+            await self._handle_cron_command(command, say)
+
+    async def _handle_cron_command(self, command: dict, say):
+        """Handle /cron slash command for CRUD on CRON.md.
+
+        Usage:
+            /cron list
+            /cron show <name>
+            /cron add <name> | <schedule> | <channel_or_dm> | <prompt> [| <post>]
+            /cron enable <name>
+            /cron disable <name>
+            /cron delete <name>
+        """
+        cron_file = self.config.agent_dir / "CRON.md"
+        text = (command.get("text") or "").strip()
+        parts = text.split(maxsplit=1)
+        action = parts[0].lower() if parts else "list"
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if action == "list":
+            tasks = _parse_cron_md(cron_file)
+            if not tasks:
+                await say("No cron tasks configured.")
+                return
+            lines = []
+            for t in tasks:
+                status = ":white_check_mark:" if t.enabled else ":no_entry_sign:"
+                target = f"<#{t.channel}>" if t.channel else (f"DM:{t.dm}" if t.dm else "log")
+                lines.append(f"{status} *{t.name}* — `{t.schedule}` → {target} [post={t.post}]")
+            await say("\n".join(lines))
+
+        elif action == "show":
+            tasks = _parse_cron_md(cron_file)
+            task = next((t for t in tasks if t.name.lower() == arg.lower()), None)
+            if not task:
+                await say(f"Task not found: `{arg}`")
+                return
+            status = "enabled" if task.enabled else "disabled"
+            target = f"<#{task.channel}>" if task.channel else (f"DM:{task.dm}" if task.dm else "log-only")
+            await say(
+                f"*{task.name}*\n"
+                f"- schedule: `{task.schedule}`\n"
+                f"- target: {target}\n"
+                f"- post: {task.post}\n"
+                f"- status: {status}\n"
+                f"- prompt: {task.prompt}"
+            )
+
+        elif action == "add":
+            # Format: name | schedule | channel_or_dm | prompt [| post]
+            fields = [f.strip() for f in arg.split("|")]
+            if len(fields) < 4:
+                await say(
+                    "Usage: `/cron add name | schedule | channel_or_dm | prompt [| post]`\n"
+                    "Example: `/cron add Morning Brief | daily 09:00 | C090L76SYLA | Prepare briefing`\n"
+                    "DM example: `/cron add Report | daily 18:00 | dm:U0ARFUDADUJ | Send daily report`"
+                )
+                return
+
+            name, schedule, target_raw, prompt = fields[0], fields[1], fields[2], fields[3]
+            post = fields[4] if len(fields) > 4 else "always"
+
+            channel, dm = "", ""
+            if target_raw.lower().startswith("dm:"):
+                dm = target_raw[3:].strip()
+            else:
+                channel = target_raw.strip()
+
+            # Validate schedule
+            schedule_lower = schedule.strip().lower()
+            try:
+                if schedule_lower.startswith("every "):
+                    _parse_interval(schedule_lower[6:])
+                elif schedule_lower.startswith("daily ") or schedule_lower.startswith("weekdays "):
+                    pass  # basic validation
+                else:
+                    await say(f"Invalid schedule: `{schedule}`. Use `every 30m`, `daily 09:00`, or `weekdays 09:00`.")
+                    return
+            except ValueError as e:
+                await say(f"Invalid schedule: {e}")
+                return
+
+            tasks = _parse_cron_md(cron_file)
+            if any(t.name.lower() == name.lower() for t in tasks):
+                await say(f"Task `{name}` already exists. Delete it first or use a different name.")
+                return
+
+            tasks.append(CronTask(
+                name=name, schedule=schedule.strip(), prompt=prompt,
+                channel=channel, dm=dm, post=post, enabled=True,
+            ))
+            _write_cron_md(cron_file, tasks)
+            await say(f":white_check_mark: Task `{name}` added (`{schedule}`).")
+
+        elif action in ("enable", "disable"):
+            tasks = _parse_cron_md(cron_file)
+            found = False
+            for t in tasks:
+                if t.name.lower() == arg.lower():
+                    t.enabled = (action == "enable")
+                    found = True
+                    break
+            if not found:
+                await say(f"Task not found: `{arg}`")
+                return
+            _write_cron_md(cron_file, tasks)
+            status = "enabled :white_check_mark:" if action == "enable" else "disabled :no_entry_sign:"
+            await say(f"Task `{arg}` {status}.")
+
+        elif action == "delete":
+            tasks = _parse_cron_md(cron_file)
+            new_tasks = [t for t in tasks if t.name.lower() != arg.lower()]
+            if len(new_tasks) == len(tasks):
+                await say(f"Task not found: `{arg}`")
+                return
+            _write_cron_md(cron_file, new_tasks)
+            await say(f":wastebasket: Task `{arg}` deleted.")
+
+        else:
+            await say(
+                "*Usage:*\n"
+                "`/cron list` — show all tasks\n"
+                "`/cron show <name>` — task details\n"
+                "`/cron add name | schedule | channel_or_dm | prompt [| post]` — add task\n"
+                "`/cron enable <name>` — resume task\n"
+                "`/cron disable <name>` — pause task\n"
+                "`/cron delete <name>` — remove task"
+            )
 
     async def _call_claude(self, system_prompt: str, messages: list[dict]) -> str:
         """Call Claude using the best available backend."""
