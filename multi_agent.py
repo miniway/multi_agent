@@ -432,6 +432,7 @@ class PersistentClaude:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024,  # 1MB line buffer (default 64KB too small for tool results)
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         logger.info(f"[{self.name}] Claude subprocess started (PID: {self.proc.pid})")
