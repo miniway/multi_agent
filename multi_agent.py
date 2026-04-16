@@ -548,6 +548,7 @@ class AgentBot:
 
         self.app = AsyncApp(token=config.bot_token)
         self.handler: Optional[AsyncSocketModeHandler] = None
+        self._slack_client: Optional[AsyncWebClient] = None
 
         # Persistent Claude subprocess (CLI mode only)
         self._claude: Optional[PersistentClaude] = None
@@ -556,6 +557,8 @@ class AgentBot:
 
         # Per-thread bot response counter (loop prevention)
         self._thread_counter: dict[str, int] = {}
+        # Active cron tasks (name → asyncio.Task)
+        self._cron_tasks: dict[str, asyncio.Task] = {}
 
         # Cache: team info string (doesn't change at runtime)
         self._team_info = "\n".join(
@@ -679,12 +682,15 @@ class AgentBot:
                 await say(f"Task `{name}` already exists. Delete it first or use a different name.")
                 return
 
-            tasks.append(CronTask(
+            new_task = CronTask(
                 name=name, schedule=schedule.strip(), prompt=prompt,
                 channel=channel, dm=dm, post=post, enabled=True,
-            ))
+            )
+            tasks.append(new_task)
             _write_cron_md(cron_file, tasks)
-            await say(f":white_check_mark: Task `{name}` added (`{schedule}`).")
+            # Start the task immediately (no restart needed)
+            self._start_cron_task(new_task)
+            await say(f":white_check_mark: Task `{name}` added and started (`{schedule}`).")
 
         elif action in ("enable", "disable"):
             tasks = _parse_cron_md(cron_file)
@@ -703,11 +709,21 @@ class AgentBot:
 
         elif action == "delete":
             tasks = _parse_cron_md(cron_file)
-            new_tasks = [t for t in tasks if t.name.lower() != arg.lower()]
-            if len(new_tasks) == len(tasks):
+            deleted_name = None
+            new_tasks = []
+            for t in tasks:
+                if t.name.lower() == arg.lower():
+                    deleted_name = t.name
+                else:
+                    new_tasks.append(t)
+            if not deleted_name:
                 await say(f"Task not found: `{arg}`")
                 return
             _write_cron_md(cron_file, new_tasks)
+            # Cancel running task
+            running = self._cron_tasks.pop(deleted_name, None)
+            if running:
+                running.cancel()
             await say(f":wastebasket: Task `{arg}` deleted.")
 
         else:
@@ -898,32 +914,37 @@ class AgentBot:
                 self._own_bot_id = ""
         return self._own_bot_id
 
+    def _start_cron_task(self, entry: CronTask) -> None:
+        """Register and start a single cron task."""
+        if entry.name in self._cron_tasks:
+            return  # already running
+        task = asyncio.create_task(self._run_cron(entry, self._slack_client))
+        self._cron_tasks[entry.name] = task
+        target = entry.channel or entry.dm or "log-only"
+        status = "enabled" if entry.enabled else "DISABLED"
+        logger.info(
+            f"[{self.config.name}] CRON: '{entry.name}' ({entry.schedule})"
+            f" → {target} [post={entry.post}, {status}]"
+        )
+
     async def start(self):
         """Start bot via Socket Mode"""
-        client = AsyncWebClient(token=self.config.bot_token)
+        self._slack_client = AsyncWebClient(token=self.config.bot_token)
         try:
-            auth = await client.auth_test()
+            auth = await self._slack_client.auth_test()
             self.config.bot_user_id = auth["user_id"]
             logger.info(f"[{self.config.name}] Connected (user_id: {self.config.bot_user_id})")
         except Exception as e:
             logger.error(f"[{self.config.name}] Auth failed: {e}")
             return
 
-        # Start cron tasks
-        self._cron_tasks: list[asyncio.Task] = []
+        # Start cron tasks from CRON.md
         cron_file = self.config.agent_dir / "CRON.md"
         cron_entries = _parse_cron_md(cron_file)
         if cron_entries:
             logger.info(f"[{self.config.name}] CRON: {len(cron_entries)} tasks loaded")
             for entry in cron_entries:
-                target = entry.channel or entry.dm or "log-only"
-                status = "enabled" if entry.enabled else "DISABLED"
-                task = asyncio.create_task(self._run_cron(entry, client))
-                self._cron_tasks.append(task)
-                logger.info(
-                    f"[{self.config.name}] CRON: '{entry.name}' ({entry.schedule})"
-                    f" → {target} [post={entry.post}, {status}]"
-                )
+                self._start_cron_task(entry)
 
         self.handler = AsyncSocketModeHandler(self.app, self.config.app_token)
         await self.handler.start_async()
@@ -1026,7 +1047,7 @@ class AgentBot:
         agent_dir = self.config.agent_dir
 
         # Cancel cron tasks
-        for task in getattr(self, "_cron_tasks", []):
+        for task in getattr(self, "_cron_tasks", {}).values():
             task.cancel()
 
         # Save conversation summary to daily log
