@@ -171,7 +171,7 @@ Repeat for each agent.
 ## How It Works
 
 - **Single process, multi-bot**: all bots run concurrently via `asyncio.gather`. Each bot is an independent `AgentBot` instance with its own Slack `AsyncApp` and Socket Mode connection.
-- **Persistent CLI subprocess**: each agent keeps one `claude -p --input-format stream-json --output-format stream-json` process alive. Messages are sent as NDJSON via stdin, responses read from stdout. Cold start on first message (~5-6s), subsequent messages reuse the process (~2-3s). Restarts automatically if the process dies.
+- **Persistent CLI subprocess**: each agent keeps one `claude -p --input-format stream-json --output-format stream-json` process alive. Messages are sent as NDJSON via stdin, responses read from stdout. Cold start on first message (~5-6s), subsequent messages reuse the process (~2-3s). Restarts automatically if the process dies. Each subprocess runs in its agent workspace directory, isolating it from project-level `CLAUDE.md`.
 - **Direct API**: if `ANTHROPIC_API_KEY` is set, uses Anthropic API directly (no CLI subprocess).
 - **Chain reactions**: if a bot's response @mentions another bot, that bot picks up and responds.
 - **Loop prevention**: per-thread response counter capped at `MAX_CHAIN_DEPTH`. Bots ignore their own messages. Stale threads pruned automatically.

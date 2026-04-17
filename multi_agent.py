@@ -211,15 +211,21 @@ def _parse_cron_md(path: Path) -> list[CronTask]:
                 enabled=enabled_raw not in ("false", "0", "no", "off"),
             ))
 
+    last_key = None
     for line in content.split("\n"):
-        line = line.strip()
-        if line.startswith("## "):
+        stripped = line.strip()
+        if stripped.startswith("## "):
             _save_current()
-            current_name = line[3:].strip()
+            current_name = stripped[3:].strip()
             current = {}
-        elif line.startswith("- ") and ":" in line:
-            key, _, val = line[2:].partition(":")
-            current[key.strip().lower()] = val.strip()
+            last_key = None
+        elif stripped.startswith("- ") and ":" in stripped:
+            key, _, val = stripped[2:].partition(":")
+            last_key = key.strip().lower()
+            current[last_key] = val.strip()
+        elif last_key and line.startswith("  ") and stripped:
+            # Continuation line (indented) — append to last key
+            current[last_key] += "\n" + stripped
 
     _save_current()
     return tasks
@@ -235,7 +241,11 @@ def _write_cron_md(path: Path, tasks: list[CronTask]) -> None:
             lines.append(f"- channel: {t.channel}")
         if t.dm:
             lines.append(f"- dm: {t.dm}")
-        lines.append(f"- prompt: {t.prompt}")
+        # Multiline prompt: first line on `- prompt:`, rest indented
+        prompt_lines = t.prompt.split("\n")
+        lines.append(f"- prompt: {prompt_lines[0]}")
+        for pl in prompt_lines[1:]:
+            lines.append(f"  {pl}")
         lines.append(f"- post: {t.post}")
         lines.append(f"- enabled: {'true' if t.enabled else 'false'}")
         lines.append("")
@@ -407,8 +417,9 @@ class PersistentClaude:
     (e.g. MEMORY.md updated) or process dies.
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, cwd: Optional[Path] = None):
         self.name = name
+        self.cwd = cwd
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
         self._stderr_task: Optional[asyncio.Task] = None
@@ -433,6 +444,7 @@ class PersistentClaude:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=1024 * 1024,  # 1MB line buffer (default 64KB too small for tool results)
+            cwd=self.cwd,  # run in agent workspace to avoid loading project CLAUDE.md
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         logger.info(f"[{self.name}] Claude subprocess started (PID: {self.proc.pid})")
@@ -550,10 +562,10 @@ class AgentBot:
         self.handler: Optional[AsyncSocketModeHandler] = None
         self._slack_client: Optional[AsyncWebClient] = None
 
-        # Persistent Claude subprocess (CLI mode only)
+        # Persistent Claude subprocess (CLI mode only, runs in agent workspace)
         self._claude: Optional[PersistentClaude] = None
         if not USE_DIRECT_API:
-            self._claude = PersistentClaude(config.name)
+            self._claude = PersistentClaude(config.name, cwd=config.agent_dir)
 
         # Per-thread bot response counter (loop prevention)
         self._thread_counter: dict[str, int] = {}
@@ -569,6 +581,9 @@ class AgentBot:
 
         # Cache: resolved user display names
         self._user_name_cache: dict[str, str] = {}
+
+        # Cache: system prompt (built once at startup, not per-message)
+        self._system_prompt: Optional[str] = None
 
         self._register_handlers()
 
@@ -785,11 +800,9 @@ class AgentBot:
             history = history[-20:]
             self.config.conversation_history[history_key] = history
 
-        system_prompt = self._build_system_prompt()
-
         logger.info(f"[{self.config.name}] Calling Claude: {readable_text[:80]}...")
         t2 = time.monotonic()
-        response_text = await self._call_claude(system_prompt, history)
+        response_text = await self._call_claude(self._system_prompt, history)
         t3 = time.monotonic()
 
         slack_text, memory_entries = _extract_and_strip_memory(response_text)
@@ -938,6 +951,9 @@ class AgentBot:
             logger.error(f"[{self.config.name}] Auth failed: {e}")
             return
 
+        # Build and cache system prompt
+        self._system_prompt = self._build_system_prompt()
+
         # Start cron tasks from CRON.md
         cron_file = self.config.agent_dir / "CRON.md"
         cron_entries = _parse_cron_md(cron_file)
@@ -996,9 +1012,8 @@ class AgentBot:
             # Execute
             try:
                 logger.info(f"[{name}] CRON '{task.name}': executing")
-                system_prompt = self._build_system_prompt()
                 response = await self._call_claude(
-                    system_prompt,
+                    self._system_prompt,
                     [{"role": "user", "content": f"[CRON: {task.name}] {task.prompt}"}],
                 )
 

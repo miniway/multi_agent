@@ -32,7 +32,7 @@ supervisorctl restart agent
 
 **Core components** (all in `multi_agent.py`):
 - `AgentConfig` — dataclass holding bot tokens, SOUL.md/TOOLS.md content, agent workspace directory, and per-thread conversation history
-- `PersistentClaude` — persistent Claude CLI subprocess per agent using stream-json protocol (`-p --input-format stream-json --output-format stream-json`). Sends NDJSON messages via stdin, reads events from stdout. Restarts on process death.
+- `PersistentClaude` — persistent Claude CLI subprocess per agent using stream-json protocol (`-p --input-format stream-json --output-format stream-json`). Sends NDJSON messages via stdin, reads events from stdout. Runs in agent workspace directory (`cwd=agent_dir`) so project-level CLAUDE.md is not loaded. Restarts on process death.
 - `_call_claude_api()` — direct Anthropic API backend (used when `ANTHROPIC_API_KEY` is set)
 - `AgentBot` — one per bot; owns an `AsyncApp`, `PersistentClaude` instance, registers event handlers, manages loop prevention, caches user names and team info
 
@@ -62,7 +62,7 @@ All config is via environment variables (see `.env`):
 
 ## Key Design Decisions
 
-- **Persistent subprocess**: Claude CLI runs as a long-lived process per agent using `--input-format stream-json --output-format stream-json --verbose`. First message has cold start (~5-6s), subsequent messages reuse the process (~2-3s). Restarts only when process dies.
+- **Persistent subprocess**: Claude CLI runs as a long-lived process per agent using `--input-format stream-json --output-format stream-json --verbose`. First message has cold start (~5-6s), subsequent messages reuse the process (~2-3s). Restarts only when process dies. Each subprocess runs in its agent workspace (`agents/{name}/`) so project-level `CLAUDE.md` is not loaded — only agent-specific files.
 - **Stream-json NDJSON protocol**: Messages sent as `{"type":"user","message":{"role":"user","content":"..."}}` via stdin. Responses read as stream-json events, waiting for `{"type":"result"}`.
 - **Channel responses**: Bot responses are posted directly to the channel, not as thread replies.
 - **Loop prevention**: Per-thread response counter (`MAX_CHAIN_DEPTH`). Stale threads (>200) auto-pruned.
