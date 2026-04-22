@@ -622,6 +622,7 @@ class AgentBot:
             /cron enable <name>
             /cron disable <name>
             /cron delete <name>
+            /cron run <name>
         """
         cron_file = self.config.agent_dir / "CRON.md"
         text = (command.get("text") or "").strip()
@@ -741,6 +742,43 @@ class AgentBot:
                 running.cancel()
             await say(f":wastebasket: Task `{arg}` deleted.")
 
+        elif action == "run":
+            tasks = _parse_cron_md(cron_file)
+            task = next((t for t in tasks if t.name.lower() == arg.lower()), None)
+            if not task:
+                await say(f"Task not found: `{arg}`")
+                return
+            await say(f":runner: Running `{task.name}` now...")
+            # Execute inline (not via the cron loop)
+            try:
+                response = await self._call_claude(
+                    self._system_prompt,
+                    [{"role": "user", "content": f"[CRON: {task.name}] {task.prompt}"}],
+                )
+                slack_text, memory_entries = _extract_and_strip_memory(response)
+                slack_text = _sanitize_for_slack(slack_text)
+                has_nopost = bool(_NOPOST_TAG_RE.search(slack_text))
+                slack_text = _NOPOST_TAG_RE.sub("", slack_text).strip()
+                for entry in memory_entries:
+                    _append_memory(self.config.agent_dir, entry)
+                _append_daily_log(self.config.agent_dir, f"CRON:{task.name}", slack_text)
+
+                if slack_text and slack_text != "No response from Claude.":
+                    msg_text = f"*[{task.name}]*\n{slack_text}"
+                    if task.dm:
+                        dm_resp = await self._slack_client.conversations_open(users=[task.dm])
+                        await self._slack_client.chat_postMessage(
+                            channel=dm_resp["channel"]["id"], text=msg_text)
+                    elif task.channel:
+                        await self._slack_client.chat_postMessage(
+                            channel=task.channel, text=msg_text)
+                    else:
+                        await say(msg_text)
+                else:
+                    await say(f"`{task.name}` executed (no output).")
+            except Exception as e:
+                await say(f":x: Error running `{task.name}`: {str(e)[:200]}")
+
         else:
             await say(
                 "*Usage:*\n"
@@ -749,7 +787,8 @@ class AgentBot:
                 "`/cron add name | schedule | channel_or_dm | prompt [| post]` — add task\n"
                 "`/cron enable <name>` — resume task\n"
                 "`/cron disable <name>` — pause task\n"
-                "`/cron delete <name>` — remove task"
+                "`/cron delete <name>` — remove task\n"
+                "`/cron run <name>` — execute now"
             )
 
     async def _call_claude(self, system_prompt: str, messages: list[dict]) -> str:
@@ -974,6 +1013,18 @@ class AgentBot:
                 return t.enabled
         return False  # task removed from CRON.md
 
+    async def _post_cron_error(self, task: CronTask, error_msg: str, client: AsyncWebClient):
+        """Post an error notification for a cron task to its target."""
+        text = f":warning: *[{task.name}]* CRON failed\n```{error_msg[:800]}```"
+        try:
+            if task.dm:
+                dm_resp = await client.conversations_open(users=[task.dm])
+                await client.chat_postMessage(channel=dm_resp["channel"]["id"], text=text)
+            elif task.channel:
+                await client.chat_postMessage(channel=task.channel, text=text)
+        except Exception as e:
+            logger.error(f"[{self.config.name}] Failed to post CRON error: {e}")
+
     async def _run_cron(self, task: CronTask, client: AsyncWebClient):
         """Run a single cron task on its schedule."""
         name = self.config.name
@@ -1017,6 +1068,12 @@ class AgentBot:
                     [{"role": "user", "content": f"[CRON: {task.name}] {task.prompt}"}],
                 )
 
+                # Detect CLI-level errors returned as response strings
+                if response.startswith(("CLI error", "CLI call failed", "Timed out", "Claude process exited")):
+                    logger.error(f"[{name}] CRON '{task.name}': CLI error: {response}")
+                    await self._post_cron_error(task, response, client)
+                    continue
+
                 slack_text, memory_entries = _extract_and_strip_memory(response)
                 slack_text = _sanitize_for_slack(slack_text)
                 # Strip <nopost/> tag
@@ -1054,7 +1111,10 @@ class AgentBot:
                 logger.info(f"[{name}] CRON '{task.name}': cancelled")
                 return
             except Exception as e:
-                logger.error(f"[{name}] CRON '{task.name}': error: {e}")
+                import traceback
+                tb = traceback.format_exc()
+                logger.error(f"[{name}] CRON '{task.name}': error: {e}\n{tb}")
+                await self._post_cron_error(task, f"{type(e).__name__}: {e}", client)
 
     async def shutdown(self):
         """Graceful shutdown: save state and stop subprocess."""
